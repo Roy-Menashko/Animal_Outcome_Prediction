@@ -68,6 +68,7 @@ install.packages(c(
   "embed",
   "yardstick"
 ))
+```
 
 ## Verify File Placement
 Ensure that `file.xlsx` is located in the same folder as `execution.Rmd`.
