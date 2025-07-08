@@ -1,0 +1,584 @@
+
+---
+title: "Data Review"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+library(finetune)
+library(doParallel) 
+library(tidymodels)   
+library(themis)       
+library(vip)          
+library(viridis)   
+library(parallel)
+library(RANN)
+library(DMwR2)
+library(readxl)
+library(stringr)
+library(scales)
+library(dplyr)
+library(pROC) 
+library(MLmetrics)
+library(tidyverse)
+library(forcats)
+library(lubridate)
+library(ggthemes)
+library(ggridges)
+library(ggplot2)
+library(ggforce)
+library(xgboost)
+library(Matrix)
+library(tictoc)
+library(embed)
+library(yardstick)
+```
+
+## Load The Data
+
+```{r}
+df <- read_excel("~/file.xlsx")
+head(df)
+```
+Raw data includes 41 columns.
+
+## Clean The Data
+
+Imbalanced Data:
+```{r}
+table(df$animal_type)
+df %>%
+  count(animal_type, sort = TRUE)
+```
+Since Most Data Divides Between Dogs And Cats We Will Focuse On Those Types.
+
+Keep Dogs And Cats Only,Drop unnaccary columns:
+```{r}
+df <- df %>% 
+  filter(animal_type %in% c("Dog", "Cat")) %>%
+  select(-age_upon_outcome,-time_in_shelter,-animal_id_outcome,-date_of_birth,-sex_upon_outcome,-`age_upon_outcome_(days)`,-`age_upon_outcome_(years)`,-age_upon_outcome_age_group,-outcome_datetime,-outcome_month,-outcome_year,-outcome_monthyear,-outcome_weekday,-outcome_hour,-outcome_number,-dob_year,-dob_month,-dob_monthyear,-animal_id_intake,-found_location,-intake_type,-count,-age_upon_intake,-`age_upon_intake_(days)`,-age_upon_intake_age_group,-intake_datetime,-intake_month,-intake_year,-intake_monthyear,-intake_weekday,-intake_hour,-intake_number,-time_in_shelter_days,-outcome_subtype)
+
+dim(df)
+```
+
+Null values:
+```{r}
+colSums(is.na(df))
+```
+Few null values-dropping rows:
+```{r}
+df <- na.omit(df) 
+colSums(is.na(df))
+```
+## Adjust columns, Feature engineering
+
+```{r}
+table(df$outcome_type)
+```
+
+Merging outcome categories to Adopted/Not Adopted:
+```{r}
+outcome_mapping <- c(
+    'Adoption'= "Adopted",       
+    'Rto-Adopt'="Adopted" ,
+    'Died'= "Not_Adopted",   
+    'Disposal'= "Not_Adopted",     
+    'Euthanasia'= "Not_Adopted",    
+    'Missing'= "Not_Adopted",          
+    'Return to Owner'= "DELETE",
+    'Transfer'= "DELETE"   
+)
+df$outcome_type <- outcome_mapping[df$outcome_type]
+df <- df[df$outcome_type!="DELETE",]
+table(df$outcome_type)
+```
+Although the resulting classes are still imbalanced, we will handle the imbalance later during model training using smote. 
+
+Turn breed into Mixed/Purebred:
+```{r}
+df$"mixed_purebred" <- ifelse(grepl("Mix", df$breed) | grepl("/", df$breed), "Mixed" , "Purebred")
+df <- df %>% 
+  select(-breed)
+table(df$"mixed_purebred")
+```
+
+Merging different colors into 3 categories:
+```{r}
+df <- df %>%
+  mutate(color_group = case_when(
+    grepl("Black", color, ignore.case = TRUE) ~ "Black", 
+    grepl("Brown|Tan|Buff|Red|Gold|Sable|Brindle|Merle|Smoke|Chocolate|Fawn|Liver|Agouti|Chocolate Point|Tabby|Tick|Tortie|Torbie|Chocolate
+", color, ignore.case = TRUE) ~ "Brown", 
+    grepl("White|Cream|Light|Yellow|Gray|Orange|Silver|Apricot|Pink|Blue|Lynx Point|Seal Point|Point|Silver Tabby|Silver|Calico|Calico Point|Tortie Point|Tricolor|Torbie
+", color, ignore.case = TRUE) ~ "Light",
+    TRUE ~ "Unknown"
+  ))
+df <- df %>%
+  select(-color)
+table(df$color_group)
+
+
+```
+
+Turn health_status into Healthy/Sick-Aged-Pregnant:
+```{r}
+df <- df %>%
+  mutate(health_status = case_when(
+    intake_condition == "Normal" ~ "Healthy",   
+    TRUE ~ "Sick_Aged_Pregnant"                          
+  )) %>%
+  select(-intake_condition)
+  
+table(df$health_status)
+
+```
+
+Turn sex_upon_intake into sex and neutered columns:
+```{r}
+df <- df %>%
+  mutate(
+    sex = case_when(
+      str_detect(sex_upon_intake, "Male") ~ "Male",  
+      str_detect(sex_upon_intake, "Female") ~ "Female",
+      TRUE ~ "Unknown" 
+    ),
+    neutered = ifelse(str_detect(sex_upon_intake, "Neutered|Spayed"), "Neutered_Spayed","Intact")
+  ) %>%
+  select(-sex_upon_intake)
+ 
+table(df$sex)
+table(df$neutered)
+```
+Although the resulting classes are still imbalanced, we will handle the imbalance later during model training using class weighting. 
+
+Turn animal_type into numeric column:
+```{r}
+df <- df %>%
+  mutate(
+    animal_type = case_when(
+      str_detect(animal_type, "Dog") ~ "Dog",  
+      str_detect(animal_type, "Cat") ~ "Cat",
+      TRUE ~ "Unknown" 
+    ))
+table(df$animal_type)
+```
+
+Change "age_upon_intake_(years)" into age_groups, and age_norm:
+```{r}
+df["age_norm"]=df$`age_upon_intake_(years)`/max(df$`age_upon_intake_(years)`)
+df <- df %>%
+  mutate(age_group = case_when(
+  `age_upon_intake_(years)`  <= 0.5 ~ "Puppy_Kitten",
+  `age_upon_intake_(years)`  <= 2 ~"Juvenile",
+  `age_upon_intake_(years)`  <= 7 ~"Adult",
+  `age_upon_intake_(years)`  > 7 ~ "Senior",
+    TRUE ~ "Unknown"
+  )) %>%
+  select (-`age_upon_intake_(years)`)
+df<-df[df$sex!="Unknown",]
+table(df$age_group)
+```
+
+convert categorical columns to factors:
+```{r}
+df$outcome_type<-as.factor(df$outcome_type)
+df$mixed_purebred<-as.factor(df$mixed_purebred)
+df$color_group<-as.factor(df$color_group)
+df$animal_type<-as.factor(df$animal_type)
+df$health_status<-as.factor(df$health_status)
+df$sex<-as.factor(df$sex)
+df$neutered<-as.factor(df$neutered)
+df$age_group<-as.factor(df$age_group)
+```
+
+View the data after changes:
+```{r}
+str(df)
+colSums(is.na(df))
+```
+Data is cleaned and adjusted
+
+```{r}
+write.csv(
+  df,
+  file = "clean_data.csv",  
+  row.names = FALSE,       
+  fileEncoding = "UTF-8"    
+)
+```
+
+
+## Review the cleaned data
+
+```{r}
+summary(df)
+```
+Most of the data is inherently imbalanced due to the typical characteristics of animals that end up in shelters. 
+We address the class imbalance within the outcome_type target variable by incorporating SMOTE directly into our cross-validation training process. 
+For these imbalances within the explanatory features, we leverage the inherent robustness of the XGBoost algorithm. Tree-based ensemble methods like XGBoost are generally less sensitive to skewed or imbalanced distributions in predictor variables compared to some other machine learning algorithms.
+
+Review the data:
+```{r}
+str(df)
+```
+One number column and the rest are factors, 9 columns, 36ת682 rows.
+The primary entities in the data are animals, specifically focusing on Dogs and Cats.
+Dogs: 22,394 entities
+Cats: 14,630 entities
+
+
+The dataset includes 9 features, which can be grouped as follows:
+
+Outcome Information:
+outcome_type
+
+Animal Characteristics:
+animal_type,
+mixed_purebred,
+color_group,
+sex,
+neutered,
+age_group,
+age_norm,
+
+Health Status:
+health_status
+
+Null values check:
+```{r}
+colSums(is.na(df))
+```
+No null values after cleaning the data.
+
+## Visualization
+
+```{r}
+ggplot(df, aes(x = outcome_type, fill = outcome_type)) +
+  geom_bar(width = 0.7, show.legend = FALSE) +
+  scale_fill_viridis_d() +
+  labs(title = "Class Balance: Outcome Types",
+       x = NULL, y = "Count") +
+  theme_minimal(base_size = 12)
+```
+# Observation :
+
+Roughly four-fifths of records end in “Adopted”, confirming a pronounced class imbalance.
+
+```{r}
+ggplot(df, aes(x = outcome_type, y = age_norm, fill = outcome_type)) +
+  geom_violin(trim = FALSE, alpha = 0.4, colour = NA) +
+  geom_boxplot(width = 0.15, outlier.shape = NA, colour = "grey20") +
+  scale_fill_viridis_d() +
+  labs(title = "Age Distribution by Outcome",
+       x = NULL, y = "Age (years)") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "none")
+```
+
+# Observation :
+
+Adopted animals are markedly younger on average than those not adopted, hinting that age will be a key predictor.
+
+```{r}
+df %>% 
+  mutate(health_status = fct_lump_n(health_status, 6)) %>%  # keep top 6 statuses
+  group_by(health_status, outcome_type) %>% 
+  summarise(n = n(), .groups = "drop") %>% 
+  group_by(health_status) %>% 
+  mutate(prop = n / sum(n)) %>% 
+  ggplot(aes(health_status, prop, fill = outcome_type)) +
+  geom_col(position = "fill") +
+  scale_y_continuous(labels = percent_format()) +
+  scale_fill_viridis_d(name = "Outcome") +
+  coord_flip() +
+  labs(title = "Adoption Share by Health Status",
+       x = NULL, y = NULL) +
+  theme_minimal(base_size = 12)
+
+```
+
+# Observation :
+
+Healthy animals see adoption shares above 90 %, whereas the “Sick / Aged / Pregnant” group drops below 40 %, underscoring the clinical hurdle to placement.
+
+```{r}
+plot_colour_rates <- df %>% 
+  mutate(color_group = fct_lump_n(color_group, 8)) %>%          # top-8 colours
+  count(color_group, outcome_type, name = "n") %>% 
+  group_by(color_group) %>% 
+  mutate(prop = n / sum(n)) %>%                                 # share within colour
+  ungroup() %>% 
+  ggplot(aes(y = fct_rev(color_group), x = prop, fill = outcome_type)) +
+  geom_col(position = "fill", width = 0.7) +
+  scale_x_continuous(labels = percent_format(accuracy = 1)) +
+  scale_fill_viridis_d(option = "C", name = "Outcome") +
+  labs(
+    title = "Adoption Share by Coat Colour",
+    x = NULL, y = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid.major.y = element_blank(),
+    axis.ticks.y       = element_blank()
+  )
+
+plot_colour_rates
+```
+
+# Observation :
+
+ross all major coat colours, adoption shares cluster tightly around 80 %, indicating that colour no longer materially affects placement likelihood.
+
+```{r}
+
+
+plot_sex_rates <- df %>% 
+  mutate(sex_simple = case_when(
+    str_detect(sex, "Male")   ~ "Male",
+    str_detect(sex, "Female") ~ "Female",
+    TRUE                                   ~ "Unknown"
+  )) %>% 
+  count(sex_simple, outcome_type, name = "n") %>% 
+  group_by(sex_simple) %>% 
+  mutate(prop = n / sum(n)) %>% 
+  ungroup() %>% 
+  ggplot(aes(x = sex_simple, y = prop, fill = outcome_type)) +
+  geom_col(position = "fill", width = 0.7) +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  scale_fill_viridis_d(option = "D", name = "Outcome") +
+  labs(
+    title = "Adoption Share by Sex",
+    x     = NULL, y = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid.major.x = element_blank(),
+    axis.ticks.x       = element_blank()
+  )
+
+plot_sex_rates
+
+```
+# Observation :
+
+Male and female animals display nearly identical adoption rates (~79 %), suggesting sex plays only a minor role in placement decisions.
+
+## Methods & Results
+
+Parallel-processing setup
+```{r}
+cores <- parallel::detectCores() - 1
+registerDoParallel(cores = cores)
+```
+
+Train / test split and CV folds
+```{r}
+set.seed(2025)
+split  <- initial_split(df, strata = outcome_type, prop = 0.80)
+train  <- training(split)
+test   <- testing(split)
+folds  <- vfold_cv(train, v = 10, strata = outcome_type)
+
+
+rec <- recipe(outcome_type ~ ., data = train) %>%
+  step_other(all_nominal_predictors(), threshold = 0.01) %>%  
+  step_dummy(all_nominal_predictors())            %>%         
+  step_zv(all_predictors())                       %>%          
+  step_smote(outcome_type)                        %>%          # SMOTE balancing
+  step_normalize(all_numeric_predictors())                      
+
+rec_prep <- prep(rec, training = train)
+n_preds  <- ncol(juice(rec_prep, all_predictors()))
+```
+
+XGBoost spec
+```{r}
+xgb_spec <- boost_tree(
+  trees          = tune(),
+  mtry           = tune(),
+  tree_depth     = tune(),
+  learn_rate     = tune(),
+  min_n          = tune(),
+  loss_reduction = tune(),
+  sample_size    = tune(),
+  stop_iter      = 20
+) %>%
+  set_engine(
+    "xgboost",
+    objective   = "binary:logistic",
+    eval_metric = "auc",
+    nthread     = cores
+  ) %>%
+  set_mode("classification")
+```
+
+Hyper-parameter space
+```{r}
+param_set <- parameters(
+  trees(range = c(200L, 1500L)),
+  mtry(range  = c(1L, n_preds)),
+  tree_depth(),
+  learn_rate(),
+  min_n(),
+  loss_reduction(),
+  sample_size = sample_prop()
+)
+```
+
+Workflow
+```{r}
+wf <- workflow() %>%
+  add_recipe(rec) %>%
+  add_model(xgb_spec)
+
+metric_fun <- metric_set(roc_auc, pr_auc, accuracy, sens, yardstick::spec, f_meas)
+options(tidymodels.progress = TRUE)
+```
+
+Racing-ANOVA tuning
+```{r}
+set.seed(2025)
+xgb_race <- tune_race_anova(
+  wf,
+  resamples = folds,
+  param_set = param_set,
+  metrics   = metric_fun,
+  control   = control_race(
+    verbose_elim  = TRUE,
+    parallel_over = "everything",
+    save_pred     = TRUE
+  )
+)
+```
+
+Finalise & evaluate on hold-out test
+```{r}
+best_params <- select_best(xgb_race, metric = "roc_auc")
+final_wf    <- finalize_workflow(wf, best_params)
+
+final_res <- last_fit(final_wf, split, metrics = metric_fun)
+```
+
+
+Confusion Matrix
+```{r}
+print(
+  collect_predictions(final_res) %>%
+    conf_mat(outcome_type, .pred_class)
+)
+```
+
+Variable importance (top-10)
+```{r}
+trained <- fit(final_wf, train) 
+vip(trained$fit$fit,
+    num_features = 10,
+    geom         = "col",
+    mapping      = aes(fill = Importance)) +
+  scale_fill_viridis_c(option = "C", direction = -1) +
+  labs(
+    title = "Top-10 Feature Importances",
+    x = NULL, y = "Importance"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position    = "none",
+    panel.grid.major.y = element_blank()
+  )
+```
+
+Best hyper-parameters (selected on CV)
+```{r}
+print(best_params)
+```
+
+Hold-out test metrics
+```{r}
+test_metrics <- collect_metrics(final_res)
+print(test_metrics)
+```
+
+Extract accuracy
+```{r}
+acc <- test_metrics %>% filter(.metric == "accuracy") %>% pull(.estimate)
+cat(sprintf("\nAccuracy: %.3f  |  Misclassification error: %.3f\n",
+            acc, 1 - acc))
+```
+
+ROC-AUC
+```{r}
+preds <- collect_predictions(final_res)
+preds$y_true <-ifelse(preds$outcome_type=="Adopted",1,0)
+
+roc_obj <- roc(preds$y_true, preds$.pred_Adopted)
+auc_value <- auc(roc_obj)
+print(paste("AUC:", round(auc_value, 3)))
+
+roc_df <- data.frame(
+  tpr = roc_obj$sensitivities,
+  fpr = 1 - roc_obj$specificities
+)
+
+ggplot(roc_df, aes(x = fpr, y = tpr)) +
+  geom_line(color = "#2196f3", size = 1.2) +
+  geom_abline(linetype = "dashed", color = "grey50") +
+  annotate("text", x = 0.7, y = 0.2, 
+           label = paste("AUC =", round(auc_value, 3)), size = 5, color = "#2196f3") +
+  labs(title = "ROC Curve: Adopted vs Not Adopted",
+       x = "False Positive Rate (1 - Specificity)",
+       y = "True Positive Rate (Sensitivity)") +
+  theme_minimal(base_size = 15)
+```
+
+XGBoost model summary
+```{r}
+trained_fit <- pull_workflow_fit(trained) 
+print(trained_fit$fit)
+```
+
+Additional Graphs
+```{r}
+df %>%
+  count(color_group, health_status, name = "n") %>%      
+  group_by(color_group) %>%                               
+  mutate(prop = n / sum(n)) %>%                           
+  ungroup() %>%
+  ggplot(aes(x = color_group, y = prop,
+             fill = health_status)) +
+  geom_col(width = .7) +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(title = "Health-status share by coat colour",
+       x = "Coat colour", y = "Share of animals") +
+  theme_minimal() +
+  theme(legend.title = element_blank())
+
+```
+
+## Observation :
+
+Black, brown, and light-coated animals show virtually identical healthy-versus-sick shares, so health status is independent of coat colour.
+
+```{r}
+df %>%
+  count(color_group, health_status, name = "n") %>%  
+  group_by(color_group) %>%                             
+  mutate(prop = n / sum(n)) %>%                          
+  ungroup() %>%
+  ggplot(aes(x = color_group, y = prop,
+             fill = health_status)) +
+  geom_col(width = .7) +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(title = "Health-status share by coat colour",
+       x = "Coat colour", y = "Share of animals") +
+  theme_minimal() +
+  theme(legend.title = element_blank())
+```
+
+## Observation :
+
+Puppies/kittens, juveniles, adults, and seniors appear in almost the same proportions across every coat colour, confirming age distribution doesn’t vary by coat colour.
